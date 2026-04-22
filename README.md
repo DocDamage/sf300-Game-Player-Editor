@@ -6,6 +6,8 @@ Windows desktop editor for browsing, validating, organizing, and importing ROMs 
 
 This project provides a polished Tkinter-based manager for SF3000 game libraries and emulator files. It is designed to work directly against a mounted SD card or a copied card image folder and focuses on the common maintenance tasks that are annoying to do by hand in Explorer.
 
+The app now ships as a small entrypoint plus a modular `sf3000/` package instead of one giant source file. That keeps the Windows/Tkinter UI, device-mount logic, validation, file operations, metadata tools, duplicate analysis, and runtime services separated into smaller units that are easier to test and maintain.
+
 The app supports:
 
 - automatic SD-card path detection on Windows
@@ -18,6 +20,9 @@ The app supports:
 - optional Recycle Bin deletion
 - optional drag-and-drop import when `tkinterdnd2` is installed
 - keyboard shortcuts, tooltips, toast notifications, and built-in shortcut help
+- duplicate scanning based on file contents, not filenames alone
+- save/restore/backup, sync, diagnostics, and device-health tools
+- an automated unit-test suite for the highest-risk workflows
 
 ## Requirements
 
@@ -159,16 +164,28 @@ Dropped folders are skipped intentionally. Import validation still applies, so d
 
 ## Project Files
 
-- `sf3000_manager.py`: main application
+- `sf3000_manager.py`: thin application entrypoint
+- `sf3000/`: application package with UI mixins, services, models, and platform helpers
+- `tests/`: automated regression tests for mount helpers, startup, diagnostics, transfer/undo, metadata, duplicate analysis, and typed payloads
+- `build_windows_exe.ps1`: helper script for packaging a Windows executable
 - `CHANGELOG.md`: session-level change summary
 - `CONTRIBUTING.md`: development and validation notes
 - `LICENSE`: MIT license
+
+## Architecture
+
+- `sf3000_manager.py` boots `SF3000GameManager` and leaves the rest to the `sf3000` package.
+- `sf3000/models.py` contains the core dataclasses, including explicit browser, operation, and UI runtime state objects.
+- `sf3000/app_*.py` modules hold the UI/controller mixins for scanning, views, file operations, validation, device tools, metadata, duplicates, history, and lifecycle behavior.
+- `sf3000/*_service.py` modules hold extracted non-UI workflows such as metadata lookup/caching and duplicate analysis.
+- `sf3000/device_mount.py`, `sf3000/layout.py`, and `sf3000/windows_fs.py` contain the Windows/WSL, SF3000-layout, and filesystem platform helpers.
 
 ## Notes
 
 - Application state is saved locally in the user profile at `~/.sf3000_game_manager.json`.
 - The app does not require third-party packages unless you want drag-and-drop support.
-- The current implementation is intentionally self-contained in a single Python file for easy distribution.
+- The source tree is modular, but the app still launches with the same simple `python sf3000_manager.py` entrypoint.
+- Deferred startup support exists for tests and smoke harnesses through `SF3000GameManager(auto_startup=False)`.
 
 ## Troubleshooting
 
@@ -184,7 +201,8 @@ Dropped folders are skipped intentionally. Import validation still applies, so d
 Quick validation:
 
 ```powershell
-python -m py_compile sf3000_manager.py
+python -m py_compile sf3000_manager.py sf3000\*.py tests\*.py
+python -m unittest discover -s tests -v
 ```
 
 ## License
