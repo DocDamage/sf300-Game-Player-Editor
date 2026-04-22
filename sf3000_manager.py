@@ -5,8 +5,8 @@ Browse and manage games and emulators on your SF3000 SD card.
 
 Requirements: Python 3.8+, no external packages needed.
 Optional: Install tkinterdnd2 to enable drag-and-drop import.
-Note: The SD card must be accessible as a drive letter.
-      Use Ext2Fsd, WSL, or DiskInternals Linux Reader to mount ext4 first.
+Optional: If Windows cannot read the SD card directly, the app can try mounting it
+          through WSL for you.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import string
 import subprocess
 import tempfile
 import threading
+import time
 import tkinter as tk
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -210,6 +211,20 @@ class TransferPlan:
     required_bytes: int
 
 
+@dataclass
+class MountCandidate:
+    disk_number: int
+    partition_number: int
+    physical_drive: str
+    friendly_name: str
+    drive_letter: str
+    filesystem: str
+    size: int
+    bus_type: str
+    mount_name: str
+    score: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Windows recycle-bin helper
 # ---------------------------------------------------------------------------
@@ -255,6 +270,338 @@ def format_size(value: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def decode_subprocess_output(data: bytes) -> str:
+    if not data:
+        return ""
+
+    if b"\x00" in data[:8] or data.count(b"\x00") > max(4, len(data) // 10):
+        try:
+            return data.decode("utf-16le", errors="ignore").replace("\ufeff", "").strip()
+        except Exception:
+            pass
+
+    for encoding in ("utf-8", "mbcs", "cp1252"):
+        try:
+            return data.decode(encoding).strip()
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore").strip()
+
+
+def run_captured_command(args: Sequence[str], timeout: int = 120) -> Tuple[int, str, str]:
+    completed = subprocess.run(
+        list(args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    return (
+        completed.returncode,
+        decode_subprocess_output(completed.stdout),
+        decode_subprocess_output(completed.stderr),
+    )
+
+
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def run_powershell_json(script: str, timeout: int = 120):
+    code, stdout, stderr = run_captured_command(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        timeout=timeout,
+    )
+    if code != 0:
+        raise OSError(stderr or stdout or "PowerShell command failed.")
+    if not stdout:
+        return {}
+    return json.loads(stdout)
+
+
+def ensure_list(value) -> List[object]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def normalize_drive_letter(value) -> str:
+    text = str(value or "").strip().strip(":").strip("\\/").upper()
+    return text if len(text) == 1 and text in string.ascii_uppercase else ""
+
+
+def extract_drive_letter(path_text: str) -> str:
+    match = re.match(r"^\s*([a-zA-Z]):", path_text or "")
+    return normalize_drive_letter(match.group(1)) if match else ""
+
+
+def extract_mount_signature(path_text: str) -> Tuple[Optional[int], Optional[int]]:
+    match = re.search(r"sf3000-disk(?P<disk>\d+)(?:-part(?P<part>\d+))?", path_text or "", re.IGNORECASE)
+    if not match:
+        return None, None
+    disk_number = int(match.group("disk"))
+    partition_raw = match.group("part")
+    return disk_number, int(partition_raw) if partition_raw else None
+
+
+def is_wsl_path(path_text: str) -> bool:
+    text = (path_text or "").strip().casefold()
+    return text.startswith("\\\\wsl$\\") or text.startswith("\\\\wsl.localhost\\")
+
+
+def list_wsl_distros() -> List[str]:
+    try:
+        names = sorted(name for name in os.listdir(r"\\wsl$") if name)
+        if names:
+            return names
+    except OSError:
+        pass
+
+    try:
+        code, stdout, _stderr = run_captured_command(["wsl.exe", "-l", "-q"], timeout=30)
+    except Exception:
+        return []
+    if code != 0:
+        return []
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+def wake_wsl_backend():
+    try:
+        subprocess.run(
+            ["wsl.exe", "-e", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except Exception:
+        pass
+
+
+def build_wsl_unc_path(distro_name: str, mount_name: str) -> Path:
+    return Path(fr"\\wsl$\{distro_name}\mnt\wsl\{mount_name}")
+
+
+def get_drive_volume_state(path_text: str) -> Optional[Dict[str, object]]:
+    drive_letter = extract_drive_letter(path_text)
+    if not drive_letter:
+        return None
+
+    script = (
+        "$vol = Get-Volume -DriveLetter "
+        + ps_quote(drive_letter)
+        + " -ErrorAction SilentlyContinue; "
+        + "if ($null -eq $vol) { return } "
+        + "$vol | Select-Object DriveLetter,FileSystem,FileSystemLabel,DriveType,Size,HealthStatus "
+        + "| ConvertTo-Json -Compress"
+    )
+    try:
+        data = run_powershell_json(script, timeout=30)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def drive_needs_wsl_mount(path_text: str) -> bool:
+    info = get_drive_volume_state(path_text)
+    if not info:
+        return False
+    filesystem = str(info.get("FileSystem") or "").strip().upper()
+    size = int(info.get("Size") or 0)
+    return filesystem in ("", "RAW") or size <= 0
+
+
+def discover_mount_candidates(preferred_path: str = "") -> List[MountCandidate]:
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[ordered]@{
+  disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,PartitionStyle,OperationalStatus,Size,IsBoot,IsSystem,Path,SerialNumber)
+  partitions = @(Get-Partition | Select-Object DiskNumber,PartitionNumber,Type,GptType,MbrType,DriveLetter,Size,AccessPaths)
+  volumes = @(Get-Volume | Select-Object DriveLetter,FileSystem,FileSystemLabel,DriveType,HealthStatus,Size,SizeRemaining,Path)
+  physical = @(Get-CimInstance Win32_DiskDrive | Select-Object DeviceID,Index,Model,InterfaceType,Size,MediaType)
+} | ConvertTo-Json -Compress -Depth 5
+"""
+    snapshot = run_powershell_json(script, timeout=180)
+    disks = {int(item["Number"]): item for item in ensure_list(snapshot.get("disks")) if item}
+    partitions = ensure_list(snapshot.get("partitions"))
+    volumes = {
+        normalize_drive_letter(item.get("DriveLetter")): item
+        for item in ensure_list(snapshot.get("volumes"))
+        if item
+    }
+    physical = {int(item["Index"]): item for item in ensure_list(snapshot.get("physical")) if item}
+
+    preferred_drive = extract_drive_letter(preferred_path)
+    preferred_disk, preferred_partition = extract_mount_signature(preferred_path)
+    candidates: List[MountCandidate] = []
+
+    for part in partitions:
+        if not part:
+            continue
+
+        disk_number = int(part.get("DiskNumber", -1))
+        partition_number = int(part.get("PartitionNumber", 0))
+        disk = disks.get(disk_number, {})
+        physical_disk = physical.get(disk_number, {})
+        if not disk or not partition_number:
+            continue
+        if disk.get("IsBoot") or disk.get("IsSystem"):
+            continue
+
+        size = int(part.get("Size") or 0)
+        if size < 256 * 1024 * 1024:
+            continue
+
+        drive_letter = normalize_drive_letter(part.get("DriveLetter"))
+        volume = volumes.get(drive_letter, {})
+        filesystem = str(volume.get("FileSystem") or "").strip().upper()
+        drive_type = str(volume.get("DriveType") or "").strip()
+        bus_type = str(disk.get("BusType") or "").strip()
+        media_type = str(physical_disk.get("MediaType") or "").strip().casefold()
+        looks_external = (
+            bus_type.upper() in {"USB", "SD", "MMC"}
+            or drive_type.casefold() == "removable"
+            or "removable" in media_type
+            or "external" in media_type
+        )
+        looks_unreadable = filesystem in ("", "RAW")
+
+        if (
+            not looks_unreadable
+            and preferred_disk != disk_number
+            and not (preferred_drive and drive_letter == preferred_drive)
+        ):
+            continue
+
+        score = 0
+        if preferred_drive and drive_letter == preferred_drive:
+            score += 120
+        if preferred_disk == disk_number:
+            score += 140
+            if preferred_partition == partition_number:
+                score += 80
+        if looks_unreadable:
+            score += 80
+        if looks_external:
+            score += 40
+        if not drive_letter:
+            score += 10
+        if size >= 1024 * 1024 * 1024:
+            score += 5
+
+        friendly_name = str(disk.get("FriendlyName") or physical_disk.get("Model") or f"Disk {disk_number}").strip()
+        physical_drive = str(physical_disk.get("DeviceID") or fr"\\.\PHYSICALDRIVE{disk_number}")
+        mount_name = f"sf3000-disk{disk_number}-part{partition_number}"
+        candidates.append(
+            MountCandidate(
+                disk_number=disk_number,
+                partition_number=partition_number,
+                physical_drive=physical_drive,
+                friendly_name=friendly_name,
+                drive_letter=drive_letter,
+                filesystem=filesystem,
+                size=size,
+                bus_type=bus_type or "Unknown",
+                mount_name=mount_name,
+                score=score,
+            )
+        )
+
+    candidates.sort(key=lambda item: (item.score, item.size), reverse=True)
+    return candidates
+
+
+def choose_auto_mount_candidate(
+    candidates: Sequence[MountCandidate],
+    preferred_path: str = "",
+) -> Optional[MountCandidate]:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    preferred_drive = extract_drive_letter(preferred_path)
+    preferred_disk, preferred_partition = extract_mount_signature(preferred_path)
+
+    if preferred_disk is not None and preferred_partition is not None:
+        for candidate in candidates:
+            if (
+                candidate.disk_number == preferred_disk
+                and candidate.partition_number == preferred_partition
+            ):
+                return candidate
+
+    if preferred_drive:
+        matching_drive = [candidate for candidate in candidates if candidate.drive_letter == preferred_drive]
+        if len(matching_drive) == 1:
+            return matching_drive[0]
+
+    if len(candidates) > 1 and candidates[0].score >= candidates[1].score + 45:
+        return candidates[0]
+    return None
+
+
+def run_elevated_wsl_mount(candidate: MountCandidate, timeout: int = 240) -> Tuple[bool, str]:
+    arguments = [
+        "--mount",
+        candidate.physical_drive,
+        "--partition",
+        str(candidate.partition_number),
+        "--type",
+        "ext4",
+        "--name",
+        candidate.mount_name,
+    ]
+    argument_list = ", ".join(ps_quote(arg) for arg in arguments)
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$proc = Start-Process -FilePath {ps_quote('wsl.exe')} "
+        + f"-ArgumentList @({argument_list}) -Verb RunAs -Wait -PassThru; "
+        + "Write-Output $proc.ExitCode"
+    )
+    try:
+        code, stdout, stderr = run_captured_command(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Timed out while waiting for WSL to mount the SD card."
+    except Exception as exc:
+        return False, str(exc)
+
+    if code != 0:
+        return False, stderr or stdout or "WSL mount failed."
+
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    exit_code = 0
+    if lines:
+        try:
+            exit_code = int(lines[-1])
+        except ValueError:
+            exit_code = 0
+
+    if exit_code != 0:
+        return False, stderr or stdout or f"WSL mount exited with code {exit_code}."
+    return True, ""
 
 
 def get_windows_drives() -> List[str]:
@@ -727,6 +1074,7 @@ class SF3000GameManager(TkBase):
         bindings = {
             "<Control-r>": self._scan_all,
             "<F5>": self._scan_all,
+            "<Control-m>": self._shortcut_mount_linux,
             "<Control-o>": self._open_in_explorer,
             "<Control-i>": self._shortcut_import,
             "<Control-f>": self._focus_active_filter,
@@ -762,6 +1110,11 @@ class SF3000GameManager(TkBase):
             (self._drive_combo, "Choose the SD-card root or mounted path. Press Enter to scan."),
             (self._browse_button, "Browse for the SF3000 SD-card root folder."),
             (self._scan_button, "Rescan the selected device. Shortcut: Ctrl+R or F5."),
+            (
+                self._mount_button,
+                "Automatically mount a Linux or RAW SD card through WSL. Shortcut: Ctrl+M. "
+                "Windows may show a UAC prompt first.",
+            ),
             (self._copy_mode_combo, "Choose whether imported files are copied or moved."),
             (
                 self._recycle_toggle,
@@ -826,6 +1179,9 @@ class SF3000GameManager(TkBase):
         else:
             self._add_emulators()
 
+    def _shortcut_mount_linux(self):
+        self._mount_linux_sd(user_initiated=True, preferred_path=self._sd_path.get().strip())
+
     def _shortcut_new_folder(self):
         if self._notebook.index(self._notebook.select()) == 0:
             self._new_game_folder()
@@ -883,7 +1239,7 @@ class SF3000GameManager(TkBase):
 
         ttk.Label(toolbar, text="SF3000 SD Card", style="Title.TLabel").pack(side="left", padx=(0, 10))
         ttk.Label(toolbar, text="Drive / Path:").pack(side="left")
-        self._drive_combo = ttk.Combobox(toolbar, textvariable=self._sd_path, width=18)
+        self._drive_combo = ttk.Combobox(toolbar, textvariable=self._sd_path, width=34)
         self._drive_combo.pack(side="left", padx=(4, 0))
         self._drive_combo.bind("<<ComboboxSelected>>", lambda _e: self._scan_all())
         self._drive_combo.bind("<Return>", lambda _e: self._scan_all())
@@ -892,6 +1248,15 @@ class SF3000GameManager(TkBase):
         self._browse_button.pack(side="left", padx=4)
         self._scan_button = ttk.Button(toolbar, text="Scan", command=self._scan_all)
         self._scan_button.pack(side="left", padx=2)
+        self._mount_button = ttk.Button(
+            toolbar,
+            text="Mount Linux SD",
+            command=lambda: self._mount_linux_sd(
+                user_initiated=True,
+                preferred_path=self._sd_path.get().strip(),
+            ),
+        )
+        self._mount_button.pack(side="left", padx=2)
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Label(toolbar, text="Import Mode:").pack(side="left")
@@ -941,7 +1306,7 @@ class SF3000GameManager(TkBase):
         self._shortcut_hint_label = ttk.Label(
             status_frame,
             text=(
-                "F1 Help  |  Ctrl+I Import  |  Ctrl+F Filter  |  F2 Rename"
+                "F1 Help  |  Ctrl+M Mount  |  Ctrl+I Import  |  Ctrl+F Filter  |  F2 Rename"
                 + ("  |  Drop files to import" if TKDND_AVAILABLE else "")
             ),
             style="Hint.TLabel",
@@ -1339,6 +1704,7 @@ class SF3000GameManager(TkBase):
 
         shortcuts = [
             ("Ctrl+R / F5", "Scan or refresh the current device"),
+            ("Ctrl+M", "Mount a Linux or RAW SD card with WSL"),
             ("Ctrl+I", "Import files into the current target folder"),
             ("Ctrl+O", "Open the current selection in Explorer"),
             ("Ctrl+F", "Focus the current tab's filter box"),
@@ -1380,6 +1746,7 @@ class SF3000GameManager(TkBase):
             "- Filter boxes search by name, extension, folder, and warning text.\n"
             "- Right-click any tree for context actions.\n"
             "- Double-click or press Enter on a file row to reveal it in Explorer.\n"
+            "- If Windows cannot read the SD card directly, use Ctrl+M or the toolbar button to let the app mount it with WSL.\n"
             + (
                 "- Drag files onto the lists to import them.\n"
                 if TKDND_AVAILABLE
@@ -1407,6 +1774,13 @@ class SF3000GameManager(TkBase):
     def _auto_detect_drive(self):
         drives = get_windows_drives()
         self._drive_combo["values"] = drives
+        current = self._sd_path.get().strip()
+
+        if current and is_wsl_path(current):
+            wake_wsl_backend()
+            if safe_exists(Path(current)):
+                self._scan_all()
+                return
 
         for drive in drives:
             if not safe_exists(Path(drive)):
@@ -1417,16 +1791,256 @@ class SF3000GameManager(TkBase):
                 self._scan_all()
                 return
 
-        for drive in drives:
-            if safe_exists(Path(drive)):
-                self._sd_path.set(drive)
-                return
+        if current and safe_exists(Path(current)) and not drive_needs_wsl_mount(current):
+            self._sd_path.set(current)
+            return
+
+        self._mount_linux_sd(
+            user_initiated=False,
+            preferred_path=current,
+            allow_choice=False,
+            quiet_if_none=True,
+        )
 
     def _browse_path(self):
         path = filedialog.askdirectory(title="Select SF3000 SD Card Root Folder")
         if path:
             self._sd_path.set(path)
             self._scan_all()
+
+    def _format_mount_candidate(self, candidate: MountCandidate) -> str:
+        drive_text = f"{candidate.drive_letter}:\\" if candidate.drive_letter else "No Windows letter"
+        filesystem = candidate.filesystem or "RAW / Linux"
+        return (
+            f"Disk {candidate.disk_number}, Partition {candidate.partition_number} | "
+            f"{drive_text} | {format_size(candidate.size)} | {filesystem} | {candidate.friendly_name}"
+        )
+
+    def _prompt_mount_candidate(self, candidates: Sequence[MountCandidate]) -> Optional[MountCandidate]:
+        dialog = tk.Toplevel(self)
+        dialog.title("Choose Linux SD Card")
+        dialog.geometry("840x300")
+        dialog.minsize(760, 260)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text="Choose the Linux or RAW partition to mount with WSL:",
+            style="Title.TLabel",
+        ).pack(anchor="w", padx=14, pady=(14, 8))
+
+        content = ttk.Frame(dialog, padding=(14, 0, 14, 12))
+        content.pack(fill="both", expand=True)
+
+        tree = ttk.Treeview(
+            content,
+            columns=("disk", "drive", "size", "filesystem", "device"),
+            show="headings",
+            selectmode="browse",
+        )
+        tree.heading("disk", text="Disk / Partition")
+        tree.heading("drive", text="Drive")
+        tree.heading("size", text="Size")
+        tree.heading("filesystem", text="Windows View")
+        tree.heading("device", text="Device")
+        tree.column("disk", width=120, minwidth=100)
+        tree.column("drive", width=90, minwidth=70, anchor="center")
+        tree.column("size", width=90, minwidth=70, anchor="e")
+        tree.column("filesystem", width=120, minwidth=100, anchor="center")
+        tree.column("device", width=360, minwidth=220)
+
+        scroll_y = ttk.Scrollbar(content, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+
+        for index, candidate in enumerate(candidates):
+            tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    f"Disk {candidate.disk_number} / P{candidate.partition_number}",
+                    f"{candidate.drive_letter}:\\" if candidate.drive_letter else "--",
+                    format_size(candidate.size),
+                    candidate.filesystem or "RAW / Linux",
+                    candidate.friendly_name,
+                ),
+            )
+
+        if candidates:
+            tree.selection_set("0")
+            tree.focus("0")
+            tree.see("0")
+
+        chosen: Dict[str, Optional[MountCandidate]] = {"value": None}
+
+        def submit():
+            selection = tree.selection()
+            if not selection:
+                return
+            chosen["value"] = candidates[int(selection[0])]
+            dialog.destroy()
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=(0, 12))
+        ttk.Button(button_frame, text="Mount", command=submit).pack(side="left", padx=6)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=6)
+        tree.bind("<Double-1>", lambda _e: submit())
+        dialog.bind("<Return>", lambda _e: submit())
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+        self.wait_window(dialog)
+        return chosen["value"]
+
+    def _mount_linux_sd(
+        self,
+        user_initiated: bool = False,
+        preferred_path: str = "",
+        allow_choice: bool = True,
+        quiet_if_none: bool = False,
+    ) -> bool:
+        if self._scan_in_progress or self._is_closing:
+            return False
+
+        self._set_scanning(True, "Looking for Linux SD cards...", action_text="Working...")
+
+        def worker():
+            try:
+                distros = list_wsl_distros()
+                if not distros:
+                    self._queue_ui(
+                        self._handle_mount_discovery_result,
+                        [],
+                        "",
+                        preferred_path,
+                        user_initiated,
+                        allow_choice,
+                        quiet_if_none,
+                        "WSL is not available or no Linux distribution is installed.",
+                    )
+                    return
+
+                candidates = discover_mount_candidates(preferred_path)
+                self._queue_ui(
+                    self._handle_mount_discovery_result,
+                    candidates,
+                    distros[0],
+                    preferred_path,
+                    user_initiated,
+                    allow_choice,
+                    quiet_if_none,
+                    "",
+                )
+            except Exception as exc:
+                self._queue_ui(
+                    self._handle_mount_discovery_result,
+                    [],
+                    "",
+                    preferred_path,
+                    user_initiated,
+                    allow_choice,
+                    quiet_if_none,
+                    str(exc),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _handle_mount_discovery_result(
+        self,
+        candidates: Sequence[MountCandidate],
+        distro_name: str,
+        preferred_path: str,
+        user_initiated: bool,
+        allow_choice: bool,
+        quiet_if_none: bool,
+        error_message: str,
+    ):
+        if error_message:
+            self._set_scanning(False)
+            self._set_status("Could not inspect Linux SD card devices.")
+            self._show_toast("Could not inspect Linux SD card devices.", kind="error")
+            if user_initiated or not quiet_if_none:
+                messagebox.showerror("Mount Linux SD", error_message)
+            return
+
+        candidate = choose_auto_mount_candidate(candidates, preferred_path)
+        if candidate is None and candidates and allow_choice:
+            self._set_scanning(False)
+            candidate = self._prompt_mount_candidate(candidates)
+            if candidate is None:
+                self._set_status("Linux SD mount canceled.")
+                self._show_toast("Linux SD mount canceled.", kind="warning")
+                return
+
+        if candidate is None:
+            self._set_scanning(False)
+            if candidates and not allow_choice:
+                message = "Multiple Linux storage devices were found. Click 'Mount Linux SD' to choose one."
+            else:
+                message = "No Linux or RAW SD card candidates were found."
+            self._set_status(message)
+            self._show_toast(message, kind="warning")
+            if user_initiated and not quiet_if_none:
+                messagebox.showinfo("Mount Linux SD", message)
+            return
+
+        self._set_scanning(
+            True,
+            f"Mounting {self._format_mount_candidate(candidate)} via WSL...",
+            action_text="Working...",
+        )
+        self._mount_candidate_async(candidate, distro_name)
+
+    def _mount_candidate_async(self, candidate: MountCandidate, distro_name: str):
+        def worker():
+            mounted_path = build_wsl_unc_path(distro_name, candidate.mount_name)
+            wake_wsl_backend()
+            path_ready = safe_exists(mounted_path)
+            ok = True
+            error_message = ""
+
+            if not path_ready:
+                ok, error_message = run_elevated_wsl_mount(candidate)
+
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                wake_wsl_backend()
+                if safe_exists(mounted_path):
+                    self._queue_ui(self._handle_mount_success, candidate, str(mounted_path))
+                    return
+                time.sleep(1.0)
+
+            if not error_message:
+                error_message = (
+                    f"WSL did not expose '{mounted_path}' after mounting "
+                    f"{self._format_mount_candidate(candidate)}."
+                )
+            if not ok and "canceled" in error_message.casefold():
+                error_message = "The Windows elevation prompt was canceled."
+            self._queue_ui(self._handle_mount_failure, error_message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_mount_success(self, candidate: MountCandidate, mounted_path: str):
+        self._set_scanning(False)
+        self._sd_path.set(mounted_path)
+        self._refresh_drive_choices()
+        self._set_status(f"Mounted {candidate.friendly_name} via WSL.")
+        self._show_toast(f"Mounted {candidate.friendly_name} via WSL.", kind="success")
+        self._scan_all()
+
+    def _handle_mount_failure(self, message: str):
+        self._set_scanning(False)
+        self._set_status("Could not mount the SD card automatically.")
+        self._show_toast("Could not mount the SD card automatically.", kind="error")
+        messagebox.showerror(
+            "Mount Linux SD",
+            message
+            + "\n\nYou can still mount the card manually with WSL if needed, then scan the mounted path again.",
+        )
 
     # ------------------------------------------------------------------
     # Background scanning
@@ -1439,13 +2053,30 @@ class SF3000GameManager(TkBase):
             return
 
         root = Path(raw)
+        if is_wsl_path(raw):
+            wake_wsl_backend()
+
+        if extract_drive_letter(raw) and drive_needs_wsl_mount(raw):
+            if self._mount_linux_sd(
+                user_initiated=False,
+                preferred_path=raw,
+                allow_choice=True,
+                quiet_if_none=False,
+            ):
+                return
+
         if not safe_exists(root):
+            if (extract_drive_letter(raw) or is_wsl_path(raw)) and self._mount_linux_sd(
+                user_initiated=False,
+                preferred_path=raw,
+                allow_choice=True,
+                quiet_if_none=False,
+            ):
+                return
             messagebox.showerror(
                 "Not Found",
                 f"Path not found:\n{raw}\n\n"
-                "Make sure the SD card is inserted and mounted.\n"
-                "If it shows as RAW, use Ext2Fsd, WSL, or DiskInternals Linux Reader "
-                "to mount the ext4 partition first.",
+                "Make sure the SD card is inserted and mounted.",
             )
             return
 
@@ -1606,17 +2237,23 @@ class SF3000GameManager(TkBase):
         else:
             self._refresh_active_status()
 
-    def _set_scanning(self, scanning: bool, message: str = ""):
+    def _set_scanning(self, scanning: bool, message: str = "", action_text: str = "Scanning..."):
         self._scan_in_progress = scanning
         if scanning:
             self._scan_button.state(["disabled"])
-            self._scan_button.configure(text="Scanning...")
+            self._mount_button.state(["disabled"])
+            self._browse_button.state(["disabled"])
+            self._drive_combo.state(["disabled"])
+            self._scan_button.configure(text=action_text)
             self._scan_progress.start(12)
             self.configure(cursor="watch")
             if message:
                 self._set_status(message)
         else:
             self._scan_button.state(["!disabled"])
+            self._mount_button.state(["!disabled"])
+            self._browse_button.state(["!disabled"])
+            self._drive_combo.state(["!disabled"])
             self._scan_button.configure(text="Scan")
             self._scan_progress.stop()
             self.configure(cursor="")

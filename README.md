@@ -9,6 +9,7 @@ This project provides a polished Tkinter-based manager for SF3000 game libraries
 The app supports:
 
 - automatic SD-card path detection on Windows
+- automatic WSL-assisted mounting for Linux or RAW SF3000 cards
 - separate Games and Emulators views
 - background scanning so the UI stays responsive
 - file filtering, sorting, validation, rename, and cleanup tools
@@ -27,6 +28,7 @@ The app supports:
 Optional:
 
 - `tkinterdnd2` for drag-and-drop import support
+- WSL with an installed Linux distribution if you want the app to auto-mount ext4 cards for you
 
 Install the optional package with:
 
@@ -41,8 +43,9 @@ The app is currently tuned for Windows behavior:
 - drive-letter auto-detection
 - Explorer integration
 - Recycle Bin support through native Windows shell APIs
+- WSL-based mounting for Linux-readable SD card partitions
 
-If your SF3000 SD card uses an ext4 partition, make sure it is mounted and accessible from Windows first.
+If your SF3000 SD card uses an ext4 partition, the app can now try to mount it through WSL for you.
 
 ## Running The App
 
@@ -99,7 +102,16 @@ You can point the app at:
 
 1. Insert or mount the SF3000 SD card in Windows.
 2. Launch the app with `python sf3000_manager.py`.
-3. If auto-detection does not pick the card up, use the path picker to point at the card root manually.
+3. If Windows shows the card as RAW or unreadable, click `Mount Linux SD` or press `Ctrl+M` and approve the UAC prompt.
+4. If auto-detection does not pick the card up, use the path picker to point at the card root or mounted `\\wsl$` path manually.
+
+### Mounting A Linux SD Card
+
+1. Insert the SF3000 SD card.
+2. Click `Mount Linux SD` in the toolbar or press `Ctrl+M`.
+3. If there is only one clear Linux or RAW candidate, the app mounts it automatically.
+4. If there are multiple candidates, choose the correct disk and partition from the in-app picker.
+5. After mounting, the app switches itself to the `\\wsl$` path and scans automatically.
 
 ### Importing ROMs
 
@@ -120,6 +132,7 @@ You can point the app at:
 | Shortcut | Action |
 |---|---|
 | `Ctrl+R` / `F5` | Scan or refresh the current device |
+| `Ctrl+M` | Mount a Linux or RAW SD card through WSL |
 | `Ctrl+I` | Import files into the current target folder |
 | `Ctrl+O` | Open the current selection in Explorer |
 | `Ctrl+F` | Focus the current tab filter |
@@ -160,9 +173,11 @@ Dropped folders are skipped intentionally. Import validation still applies, so d
 ## Troubleshooting
 
 - If auto-detect does not find the card, browse to the mounted card root manually.
+- If Windows shows the card as RAW or unreadable, use `Mount Linux SD` and approve the UAC prompt so WSL can mount it.
 - If the Emulators tab looks empty, create a recognized emulator root folder from the app and rescan.
 - If drag-and-drop is unavailable, install `tkinterdnd2` and relaunch the app.
-- If Windows cannot access the card contents, verify the SD card or image is mounted with a filesystem Windows can read.
+- If automatic Linux mounting is unavailable, verify WSL is installed and has at least one distribution configured.
+- If Windows still cannot access the card contents after mounting, verify the SD card is healthy and the ext4 partition is supported by your current WSL build.
 
 ## Development
 
